@@ -44,6 +44,7 @@ typedef enum _GstDemuxerESState
 struct _GstDemuxerESPrivate
 {
   GstElement *pipeline;
+  GstElement *parsebin;
   GstElement *funnel;
   GstElement *appsink;
 
@@ -112,8 +113,8 @@ appsink_handle_event (GstDemuxerES * demuxer, GstEvent * event)
   gboolean ret = FALSE;
   GST_LOG ("%" GST_PTR_FORMAT, event);
   switch (GST_EVENT_TYPE (event)) {
-    // Each time the funnel receives this event it will tell the next buffer type and id
-    // by changing the global current value.
+      // Each time the funnel receives this event it will tell the next buffer type and id
+      // by changing the global current value.
     case GST_EVENT_STREAM_START:{
       const gchar *stream_id;
       GstDemuxerEStream *stream;
@@ -123,7 +124,9 @@ appsink_handle_event (GstDemuxerES * demuxer, GstEvent * event)
         priv->current_stream_id = stream->id;
         priv->current_stream_type = stream->type;
       } else {
-        GST_WARNING ("Received GST_EVENT_STREAM_START for an unknown stream id %s", stream_id);
+        GST_WARNING
+            ("Received GST_EVENT_STREAM_START for an unknown stream id %s",
+            stream_id);
       }
       ret = TRUE;
       break;
@@ -169,16 +172,13 @@ appsink_read_packet (GstDemuxerES * demuxer)
     if (buffer) {
       packet = g_new (GstDemuxerESPacket, 1);
       *packet = (GstDemuxerESPacket) {
-        .priv = NULL,
-        .stream_type = priv->current_stream_type,
-        .stream_id = priv->current_stream_id,
-        .packet_number = packet_counter,
-        .pts = GST_BUFFER_PTS (buffer),
-        .dts = GST_BUFFER_DTS (buffer),
-        .duration = GST_BUFFER_DURATION (buffer)
+        .priv = NULL,.stream_type = priv->current_stream_type,.stream_id =
+            priv->current_stream_id,.packet_number = packet_counter,.pts =
+            GST_BUFFER_PTS (buffer),.dts = GST_BUFFER_DTS (buffer),.duration =
+            GST_BUFFER_DURATION (buffer)
       };
       packet->priv = g_new (GstDemuxerESPacketPrivate, 1),
-      packet->priv->sample = sample;
+          packet->priv->sample = sample;
       packet_counter++;
       gst_buffer_map (buffer, &packet->priv->map, GST_MAP_READ);
       packet->data = packet->priv->map.data;
@@ -364,7 +364,7 @@ wait_for_demuxer_ready (GstDemuxerES * demuxer)
 }
 
 static void
-uridecodebin_pad_added_cb (GstElement * uridecodebin, GstPad * pad,
+parsebin_pad_added_cb (GstElement * parsebin, GstPad * pad,
     GstDemuxerES * demuxer)
 {
   GstDemuxerEStream *stream = NULL;
@@ -395,23 +395,45 @@ uridecodebin_pad_added_cb (GstElement * uridecodebin, GstPad * pad,
 }
 
 static void
-uridecodebin_pad_no_more_pads (GstElement * uridecodebin,
+urisourcebin_pad_added_cb (GstElement * urisourcebin, GstPad * pad,
     GstDemuxerES * demuxer)
 {
-  GST_INFO ("No more pads received from %s", GST_ELEMENT_NAME (uridecodebin));
+  GstDemuxerEStream *stream = NULL;
+  GstPad *parsebin_pad;
+  GstDemuxerESPrivate *priv = demuxer->priv;
+
+  if (!GST_PAD_IS_SRC (pad))
+    return;
+
+  GST_DEBUG ("pad %s:%s", GST_DEBUG_PAD_NAME (pad));
+
+  parsebin_pad = gst_element_get_static_pad (priv->parsebin, "sink");
+
+  if (gst_pad_link (pad, parsebin_pad) != GST_PAD_LINK_OK)
+    GST_ERROR ("Unable to link the pad %p to the parsebin pad", pad);
+  gst_object_unref (parsebin_pad);
+
+  GST_DEBUG ("Done linking");
+}
+
+static void
+parsebin_pad_no_more_pads (GstElement * parsebin, GstDemuxerES * demuxer)
+{
+  GST_INFO ("No more pads received from %s", GST_ELEMENT_NAME (parsebin));
   if (demuxer->priv->state == DEMUXER_ES_STATE_IDLE) {
     set_demuxer_state (demuxer, DEMUXER_ES_STATE_READY);
   }
 }
 
 static GstAutoplugSelectResult
-uridecodebin_autoplug_select_cb (GstElement * src, GstPad * pad,
+parsebin_autoplug_select_cb (GstElement * src, GstPad * pad,
     GstCaps * caps, GstElementFactory * factory, GstDemuxerES * demuxer)
 {
   GstAutoplugSelectResult ret = GST_AUTOPLUG_SELECT_TRY;
-  if (gst_element_factory_list_is_type (factory,
+
+  if (!factory || gst_element_factory_list_is_type (factory,
           GST_ELEMENT_FACTORY_TYPE_DECODER)) {
-    GST_DEBUG ("Expose pad if factory is decoder.");
+    GST_DEBUG ("Expose pad if factory is decoder or null.");
     ret = GST_AUTOPLUG_SELECT_EXPOSE;
   }
 
@@ -419,7 +441,7 @@ uridecodebin_autoplug_select_cb (GstElement * src, GstPad * pad,
 }
 
 static gboolean
-autoplug_query_caps (GstElement * uridecodebin, GstPad * pad,
+autoplug_query_caps (GstElement * parsebin, GstPad * pad,
     GstElement * element, GstQuery * query, GstDemuxerES * demuxer)
 {
   GstCaps *result = NULL;
@@ -468,12 +490,12 @@ done:
 }
 
 static gboolean
-uridecodebin_autoplug_query_cb (GstElement * uridecodebin, GstPad * pad,
+parsebin_autoplug_query_cb (GstElement * parsebin, GstPad * pad,
     GstElement * element, GstQuery * query, GstDemuxerES * demuxer)
 {
   switch (GST_QUERY_TYPE (query)) {
     case GST_QUERY_CAPS:
-      return autoplug_query_caps (uridecodebin, pad, element, query, demuxer);
+      return autoplug_query_caps (parsebin, pad, element, query, demuxer);
     default:
       return FALSE;
   }
@@ -486,12 +508,19 @@ handle_bus_message (GstBus * bus, GstMessage * message, GstDemuxerES * demuxer)
   switch (GST_MESSAGE_TYPE (message)) {
     case GST_MESSAGE_ERROR:
     {
-      set_demuxer_state (demuxer, DEMUXER_ES_STATE_ERROR);;
+      set_demuxer_state (demuxer, DEMUXER_ES_STATE_ERROR);
       break;
     }
     case GST_MESSAGE_EOS:
     {
-      set_demuxer_state (demuxer, DEMUXER_ES_STATE_EOS);;
+      set_demuxer_state (demuxer, DEMUXER_ES_STATE_EOS);
+      break;
+    }
+    // parsebin does not trigger 'no-more-pads' with elementary stream, rely on stream-collection event instead
+    // See https://gitlab.freedesktop.org/gstreamer/gstreamer/-/issues/2119
+    case GST_MESSAGE_STREAM_COLLECTION:
+    {
+      set_demuxer_state (demuxer, DEMUXER_ES_STATE_READY);
       break;
     }
     case GST_MESSAGE_ELEMENT:
@@ -550,7 +579,7 @@ gst_demuxer_es_new (const gchar * uri)
 {
   GstDemuxerES *demuxer;
   GstDemuxerESPrivate *priv;
-  GstElement *uridecodebin;
+  GstElement *urisourcebin;
   GstStateChangeReturn sret;
   gchar *current_uri;
 
@@ -571,27 +600,30 @@ gst_demuxer_es_new (const gchar * uri)
 
   priv->pipeline = gst_pipeline_new ("demuxeres");
 
-  uridecodebin = gst_element_factory_make ("uridecodebin", NULL);
+  urisourcebin = gst_element_factory_make ("urisourcebin", NULL);
+  g_object_set (G_OBJECT (urisourcebin), "uri", current_uri, NULL);
+
+  g_signal_connect (urisourcebin, "pad-added",
+      G_CALLBACK (urisourcebin_pad_added_cb), demuxer);
+
+  priv->parsebin = gst_element_factory_make ("parsebin", NULL);
   GST_DEBUG ("New demuxeres with uri: %s", current_uri);
-  g_object_set (G_OBJECT (uridecodebin), "uri", current_uri, NULL);
-
   g_free (current_uri);
-
-  g_signal_connect (uridecodebin, "pad-added",
-      G_CALLBACK (uridecodebin_pad_added_cb), demuxer);
-  g_signal_connect (uridecodebin, "no-more-pads",
-      G_CALLBACK (uridecodebin_pad_no_more_pads), demuxer);
-  g_signal_connect (uridecodebin, "autoplug-select",
-      G_CALLBACK (uridecodebin_autoplug_select_cb), demuxer);
-  g_signal_connect (uridecodebin, "autoplug-query",
-      G_CALLBACK (uridecodebin_autoplug_query_cb), demuxer);
+  g_signal_connect (priv->parsebin, "pad-added",
+      G_CALLBACK (parsebin_pad_added_cb), demuxer);
+  g_signal_connect (priv->parsebin, "no-more-pads",
+      G_CALLBACK (parsebin_pad_no_more_pads), demuxer);
+  g_signal_connect (priv->parsebin, "autoplug-select",
+      G_CALLBACK (parsebin_autoplug_select_cb), demuxer);
+  g_signal_connect (priv->parsebin, "autoplug-query",
+      G_CALLBACK (parsebin_autoplug_query_cb), demuxer);
 
   priv->funnel = gst_element_factory_make ("funnel", "funnel_demuxeres");
   priv->appsink = gst_element_factory_make ("appsink", NULL);
   g_object_set (priv->appsink, "sync", FALSE, NULL);
 
-  gst_bin_add_many (GST_BIN (priv->pipeline), uridecodebin, priv->funnel,
-      priv->appsink, NULL);
+  gst_bin_add_many (GST_BIN (priv->pipeline), urisourcebin, priv->parsebin,
+      priv->funnel, priv->appsink, NULL);
 
   gst_element_link_many (priv->funnel, priv->appsink, NULL);
 
